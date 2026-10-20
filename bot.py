@@ -507,4 +507,25 @@ async def help_cmd(ctx):
     e.field("Usage", f"`{PREFIX}{usage}`").field("Category", CATEGORIES[cat], True).field("Status", status, True)
     await ctx.reply("", embeds=[e])
 
+# ------------------------------------------------------------------ health server
+# Render Web Services only turn "Live" once something listens on $PORT.
+# This tiny server answers "ok" so the deploy completes (and uptime pingers can hit it).
+def start_health_server():
+    port = os.environ.get("PORT")
+    if not port:
+        return
+    import threading
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    class H(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200); self.end_headers(); self.wfile.write(b"ok")
+        do_HEAD = do_GET
+        def log_message(self, *a):
+            pass
+
+    threading.Thread(target=HTTPServer(("0.0.0.0", int(port)), H).serve_forever, daemon=True).start()
+    log.info("health server listening on %s", port)
+
+start_health_server()
 bot.run()
