@@ -204,7 +204,11 @@ def bar(cur, total, width=10):
 @bot.event
 async def on_message(ctx):
     uid = ctx.author_id
-    if not uid or ctx.content.startswith(PREFIX):
+    if not uid:
+        return
+    if await mass_ping_check(ctx):
+        return
+    if ctx.content.startswith(PREFIX):
         return
     if ctx.server_id and "leveling" in disabled_set(ctx.server_id):
         return
@@ -383,10 +387,90 @@ async def antiraid(ctx):
     await ctx.reply("Antiraid updated.")
 
 # ------------------------------------------------------------------ antinuke
-# Yapper's bot API has no audit log or delete/ban events, so the bot can't see WHO
-# did something. Instead it polls every 20s and undoes mass damage:
-#   - 3+ channels deleted within one poll  -> recreate them
-#   - 5+ new bans within one poll          -> unban them
+# Four modules, each with its own on/off switch and threshold (all per server):
+#   massban     5+ new bans in one 20s check          -> unban them, alert
+#   masskick    5+ members leaving within 10s          -> alert only (see note below)
+#   chandelete  3+ channels deleted in one 20s check   -> recreate them, alert
+#   massping    5+ mentions in one message, or 10+ in 10s from one person
+#               -> delete the message, time the user out for 10 min, alert
+# Yapper's bot API has no audit log, so for ban/kick/channel-delete the bot sees WHAT
+# happened but not WHO did it. Only massping knows the culprit.
+# Kicks look the same as members leaving, so masskick can only warn; it can't undo them.
+NUKE_MODS = {
+    # module: (settings key, default threshold, label)
+    "massban":    ("ban_threshold",  5, "Mass ban"),
+    "masskick":   ("kick_threshold", 5, "Mass kick"),
+    "chandelete": ("chan_threshold", 3, "Channel mass delete"),
+    "massping":   ("ping_threshold", 5, "Mass ping"),
+}
+NUKE_ALIASES = {"massban": "massban", "bans": "massban", "masskick": "masskick", "kicks": "masskick",
+                "chandelete": "chandelete", "channels": "chandelete", "massping": "massping", "pings": "massping"}
+
+def nuke_on(sid):
+    return setting(f"{sid}:antinuke", "on") == "on"
+
+def mod_on(sid, mod):
+    return nuke_on(sid) and setting(f"{sid}:nuke_{mod}", "on") == "on"
+
+def mod_limit(sid, mod):
+    key, default, _ = NUKE_MODS[mod]
+    return int(setting(f"{sid}:{key}", default))
+
+async def alert(sid, text):
+    ch = setting(f"{sid}:alert_channel")
+    if ch:
+        await say(ch, text)
+
+# ---- mass ping (we know who did it, so we can act on them)
+MENTION_RE = re.compile(r"<@!?[^>\s]+>|@everyone|@here")
+ping_log = collections.defaultdict(collections.deque)
+
+async def mass_ping_check(ctx):
+    sid = ctx.server_id
+    if not sid or not mod_on(sid, "massping") or trusted(ctx.author_id):
+        return False
+    count = len(MENTION_RE.findall(ctx.content or ""))
+    if not count:
+        return False
+    now, q = time.time(), ping_log[(sid, ctx.author_id)]
+    q.append((now, count))
+    while q and now - q[0][0] > 10:
+        q.popleft()
+    total = sum(c for _, c in q)
+    if count < mod_limit(sid, "massping") and total < int(setting(f"{sid}:ping_total", 10)):
+        return False
+    q.clear()
+    try:
+        await bot.delete(ctx.channel_id, ctx.id)
+    except Exception as e:
+        log.warning("delete ping message failed: %s", e)
+    try:
+        await bot.timeout(sid, ctx.author_id, 10, reason="Antinuke: mass ping")
+    except Exception as e:
+        log.warning("timeout failed: %s", e)
+    await say(ctx.channel_id, f"<@{ctx.author_id}> mass pinging isn't allowed. Message removed and you're timed out for 10 minutes.")
+    await alert(sid, f"Antinuke: mass ping by <@{ctx.author_id}> ({count} mentions). Message deleted, user timed out 10 min.")
+    return True
+
+# ---- mass kick (members leaving in a burst)
+leave_log = collections.defaultdict(collections.deque)
+leave_alerted = {}
+
+@bot.event
+async def on_member_leave(p):
+    log.info("member_leave payload: %s", p)          # check Render logs once to confirm the keys
+    sid = str(p.get("server_id") or "")
+    if not sid or not mod_on(sid, "masskick"):
+        return
+    now, q = time.time(), leave_log[sid]
+    q.append(now)
+    while q and now - q[0] > 10:
+        q.popleft()
+    if len(q) >= mod_limit(sid, "masskick") and now - leave_alerted.get(sid, 0) > 60:
+        leave_alerted[sid] = now
+        await alert(sid, f"Antinuke: {len(q)} members left within 10 seconds. If that wasn't a mass kick, ignore this. Check who has kick permission.")
+
+# ---- mass ban + channel mass delete (polling)
 snap = {}
 
 async def watchdog():
@@ -395,14 +479,13 @@ async def watchdog():
         try:
             for s in await bot.servers():
                 sid = oid(s)
-                if sid and setting(f"{sid}:antinuke", "on") == "on":
+                if sid and (mod_on(sid, "massban") or mod_on(sid, "chandelete")):
                     await guard_server(sid)
         except Exception as e:
             log.warning("watchdog: %s", e)
         await asyncio.sleep(20)
 
 async def guard_server(sid):
-    alert = setting(f"{sid}:alert_channel")
     chans = {c.id: c for c in await bot.channels(sid, force=True)}
     bans = {oid(b) for b in (await bot.bans(sid) or [])}
     prev = snap.get(sid)
@@ -410,41 +493,57 @@ async def guard_server(sid):
     if prev is None:
         return
     gone = [c for cid, c in prev["chans"].items() if cid not in chans]
-    if len(gone) >= int(setting(f"{sid}:chan_threshold", 3)):
+    if mod_on(sid, "chandelete") and len(gone) >= mod_limit(sid, "chandelete"):
         for c in gone[:25]:
             try:
                 await bot.create_channel(sid, c.name, kind=c.type or "text", category_id=c.category_id)
             except Exception as e:
                 log.warning("restore channel failed: %s", e)
-        if alert:
-            await say(alert, f"Antinuke: {len(gone)} channels were deleted at once, recreated them (messages can't be restored).")
+        await alert(sid, f"Antinuke: {len(gone)} channels were deleted at once, recreated them (messages can't be restored).")
     new_bans = bans - prev["bans"]
-    if len(new_bans) >= int(setting(f"{sid}:ban_threshold", 5)):
+    if mod_on(sid, "massban") and len(new_bans) >= mod_limit(sid, "massban"):
         for uid in new_bans:
             try:
                 await bot.unban(sid, uid)
             except Exception as e:
                 log.warning("unban failed: %s", e)
-        if alert:
-            await say(alert, f"Antinuke: {len(new_bans)} bans at once, reverted them.")
+        await alert(sid, f"Antinuke: {len(new_bans)} bans at once, reverted them.")
 
-@cmd("antinuke", "admin", "antinuke on|off | alert <channel_id> | channels <n> | bans <n>",
-     "Watches for mass channel deletions (recreates them) and mass bans (reverts them). 'alert' sets where warnings are posted. Owner/trusted only.")
+@cmd("antinuke", "admin", "antinuke status | on|off | <module> on|off|<number> | alert <channel_id>",
+     "Protection against server nuking. Modules: massban, masskick, chandelete, massping. "
+     "'antinuke massban off' toggles one module, 'antinuke massban 8' sets its threshold, "
+     "'antinuke massping total 15' sets mentions per 10s. 'alert' sets where warnings go. Owner/trusted only.")
 async def antinuke(ctx):
     if not trusted(ctx.author_id):
         return await ctx.reply("Owner/trusted only")
-    a, s = ctx.argv, ctx.server_id
-    if a and a[0] in ("on", "off"):
+    a, s = [x.lower() for x in ctx.argv], ctx.server_id
+    usage = f"Usage: `{PREFIX}help antinuke`"
+    if not a or a[0] == "status":
+        e = Embed().title("Antinuke").description(f"Master switch: **{setting(f'{s}:antinuke', 'on')}**   |   Alerts: " +
+                                                  (f"<#{setting(f'{s}:alert_channel')}>" if setting(f"{s}:alert_channel") else "not set"))
+        for mod, (key, default, label) in NUKE_MODS.items():
+            extra = f", {setting(f'{s}:ping_total', 10)} per 10s" if mod == "massping" else ""
+            e.field(label, f"{setting(f'{s}:nuke_{mod}', 'on')} (threshold {mod_limit(s, mod)}{extra})", True)
+        return await ctx.reply("", embeds=[e])
+    if a[0] in ("on", "off"):
         put(f"{s}:antinuke", a[0])
-    elif len(a) == 2 and a[0] == "alert":
+        return await ctx.reply(f"Antinuke master switch {a[0]}.")
+    if a[0] == "alert" and len(a) == 2:
         put(f"{s}:alert_channel", a[1].strip("<#>"))
-    elif len(a) == 2 and a[0] == "channels" and a[1].isdigit():
-        put(f"{s}:chan_threshold", a[1])
-    elif len(a) == 2 and a[0] == "bans" and a[1].isdigit():
-        put(f"{s}:ban_threshold", a[1])
-    else:
-        return await ctx.reply(f"Usage: `{PREFIX}antinuke on|off|alert <channel_id>|channels <n>|bans <n>`")
-    await ctx.reply("Antinuke updated.")
+        return await ctx.reply("Alert channel saved.")
+    mod = NUKE_ALIASES.get(a[0])
+    if not mod or len(a) < 2:
+        return await ctx.reply(usage)
+    if a[1] in ("on", "off"):
+        put(f"{s}:nuke_{mod}", a[1])
+        return await ctx.reply(f"{NUKE_MODS[mod][2]} {a[1]}.")
+    if a[1].isdigit() and int(a[1]) > 0:
+        put(f"{s}:{NUKE_MODS[mod][0]}", a[1])
+        return await ctx.reply(f"{NUKE_MODS[mod][2]} threshold set to {a[1]}.")
+    if mod == "massping" and a[1] == "total" and len(a) == 3 and a[2].isdigit() and int(a[2]) > 0:
+        put(f"{s}:ping_total", a[2])
+        return await ctx.reply(f"Mass ping limit set to {a[2]} mentions per 10 seconds.")
+    await ctx.reply(usage)
 
 # ------------------------------------------------------------------ tickets
 @cmd("ticketpanel", "tickets", "ticketpanel", "Post the 'Open ticket' button in this channel. Owner/trusted only.")
