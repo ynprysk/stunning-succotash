@@ -67,8 +67,25 @@ def n(x):
     return f"{int(x):,}"
 
 def parse_uid(s):
-    return s.strip("<@!>") if s else ""
+    """Extract a numeric user ID from a mention, ID, or user object."""
+    if s is None:
+        return ""
 
+    if isinstance(s, dict):
+        s = s.get("id") or s.get("user_id") or ""
+
+    elif not isinstance(s, (str, int)):
+        s = getattr(s, "id", None) or getattr(s, "user_id", None) or ""
+
+    s = str(s).strip()
+
+    # Handles <@123456789>, <@!123456789>, and plain IDs.
+    match = re.fullmatch(r"(?:<@!?(\d+)>|(\d+))", s)
+
+    if match:
+        return match.group(1) or match.group(2)
+
+    return ""
 def fmt_time(sec):
     sec = int(sec)
     h, m = sec // 3600, sec % 3600 // 60
